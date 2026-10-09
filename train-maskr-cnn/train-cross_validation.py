@@ -1,7 +1,4 @@
-import warnings
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=UserWarning)
-
+import math
 from detectron2.engine import DefaultPredictor
 from detectron2.data import dataset_mapper
 import optuna
@@ -21,29 +18,39 @@ from optuna.visualization import plot_param_importances, plot_optimization_histo
 from utils import evaluate_semantic_metrics
 from pycocotools.coco import COCO
 import pandas as pd
+import warnings
+import numpy as np
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 
 MODEL_NAME = "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"
 CLASSES = ['aerial', 'root']
 SEED = 42
 WORKERS = 4
-N_TRIALS = 5
+N_TRIALS = 50
+N_STARTUP_TRIALS = 5
 DATASET_PATH = "train-maskr-cnn/Dataset_splitted"
 FOLDS_DIR = "train-maskr-cnn/folds"
+EVAL_PERIOD = 50
 def objective(trial, holdout_data, fold):
-    lr0 = trial.suggest_categorical("lr0", [0.0001, 0.0005, 0.001])
-    weight_decay = trial.suggest_categorical("weight_decay",[1e-5, 1e-4, 1e-3])
+    lr0 = trial.suggest_float("lr0", 1e-4, 1e-2, log=True)
+    weight_decay = trial.suggest_float("weight_decay", 1e-5, 1e-3, log=True)
     imgsz = trial.suggest_categorical("imgsz", [256, 512, 640])
-    # Definir a quantidade de iterations
-    #iterations = trial.suggest_categorical("iterations", [150, 200, 250])
     iterations = trial.suggest_categorical("iterations", [2600, 3500, 4400])
+    degrees = trial.suggest_float("degrees", 0.0, 30.0, step=5.0)
+    hsv_v = trial.suggest_float("hsv_v", 0.1, 0.8, step=0.05)
+    scale = trial.suggest_float("scale", 0.1, 0.8, step=0.05)
+    fliplr = trial.suggest_float("fliplr", 0.0, 0.5, step=0.1)
+
+    #weight_decay = trial.suggest_categorical("weight_decay",[1e-5, 1e-4, 1e-3])
+    #lr0 = trial.suggest_categorical("lr0", [0.0001, 0.0005, 0.001])
+    #iterations = trial.suggest_categorical("iterations", [2600, 3500, 4400])
     #degrees = trial.suggest_categorical("degrees", [15,25,35])
-    degrees = trial.suggest_float("degrees", 15.0, 35.0)
     #hsv_v = trial.suggest_categorical("hsv_v", [0.4, 0.6, 0.8])
-    hsv_v = trial.suggest_float("hsv_v", 0.1, 0.8)
     #fliplr = trial.suggest_categorical("fliplr", [0.0, 0.5, 0.8])
-    fliplr = trial.suggest_float("fliplr", 0.0, 0.8)
     #scale = trial.suggest_categorical("scale", [0.1, 0.5, 0.8])
-    scale = trial.suggest_float("scale", 0.1, 0.8)
+    
 
     if imgsz <= 256:
         dynamic_batch_size = 4
@@ -69,7 +76,7 @@ def objective(trial, holdout_data, fold):
         val_name=VAL_NAME,
         min_size_train=imgsz,
         max_size_train=imgsz,
-        eval_period=350,
+        eval_period=0,
         num_workers=WORKERS,
         batch_size=dynamic_batch_size,
         learning_rate=lr0,
@@ -87,46 +94,82 @@ def objective(trial, holdout_data, fold):
         random_flip_prob=fliplr,
         scale = scale
     )
-
-    train(output_dir=output_dir, cfg=cfg, resume=False)
-    torch.cuda.empty_cache()
-    cfg.MODEL.WEIGHTS = os.path.join(output_dir, "model_final.pth")
-    cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.5
-    evaluator = COCOEvaluator(VAL_NAME, tasks=("bbox", "segm"), output_dir=os.path.join(output_dir, 'optuna_eval'))
-    val_loader = build_detection_test_loader(cfg, VAL_NAME)
-    predictor = DefaultPredictor(cfg)
-    metrics_dict = inference_on_dataset(predictor.model, val_loader, evaluator)
-    coco = COCO(holdout_data['VAL_JSON_DIR'])
-    seg_metrics_dict = evaluate_semantic_metrics(predictor, coco, holdout_data['VAL_DATA_DIR'], VAL_NAME)
-    import math
-    # current_ap = metrics_dict["segm"]["AP"]
-    #current_ap = metrics_dict.get("segm", {}).get("AP", 0.0)
-    current_miou = seg_metrics_dict["mIoU"]
-    if current_miou is None or math.isnan(float(current_miou)):
-        current_miou = 0.0
-
-    # 2. Descobre qual era o melhor valor até este trial
+    predictor = None
+    coco = None
     try:
-        best_value_so_far = trial.study.best_value
-    except ValueError:
-        # Se for o primeiro trial (trial 0), ainda não existe best_value
-        best_value_so_far = -1.0
+        train(output_dir=output_dir, cfg=cfg, resume=False, trial=trial, eval_period=EVAL_PERIOD)
+        torch.cuda.empty_cache()
+        cfg.MODEL.WEIGHTS = os.path.join(output_dir, "model_final.pth")
+        cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.5
 
-    
-    if current_miou >= best_value_so_far:
-        if os.path.exists(best_trial_dir):
-            shutil.rmtree(best_trial_dir)
-        shutil.copytree(output_dir, best_trial_dir)
-        print(f"Novo melhor trial ({trial.number}) com AP = {current_miou:.4f}. Pesos e métricas preservados!")
+    #evaluator = COCOEvaluator(VAL_NAME, tasks=("bbox", "segm"), output_dir=os.path.join(output_dir, 'optuna_eval'))
+    #val_loader = build_detection_test_loader(cfg, VAL_NAME)
+    #metrics_dict = inference_on_dataset(predictor.model, val_loader, evaluator)
 
-    if os.path.exists(output_dir):
-        shutil.rmtree(output_dir, ignore_errors=True)
-    
-    del evaluator, val_loader, metrics_dict, predictor, coco
-    gc.collect()
-    torch.cuda.empty_cache()
-    
-    return current_miou
+        predictor = DefaultPredictor(cfg)
+        coco = COCO(holdout_data['VAL_JSON_DIR'])
+        seg_metrics_dict = evaluate_semantic_metrics(predictor, coco, holdout_data['VAL_DATA_DIR'], VAL_NAME)
+
+        miou = seg_metrics_dict['mIoU']
+        mdice = seg_metrics_dict['mDice']
+        precision = seg_metrics_dict['Precision']
+        recall = seg_metrics_dict['Recall']
+        iou_per_cls = seg_metrics_dict['mIoU_per_class']
+        dice_per_cls = seg_metrics_dict['mDice_per_class']
+        precision_per_cls = seg_metrics_dict['Precision_per_class']
+        recall_per_cls = seg_metrics_dict['Recall_per_class']
+
+        metrics_data = {
+            'mIoU': miou,
+            'mDice': mdice,
+            'Precision_pixel': precision,
+            'Recall_pixel': recall,
+            'Iou_aerial': iou_per_cls['aerial'],
+            'Iou_root': iou_per_cls['root'],
+            'Dice_aerial': dice_per_cls['aerial'],
+            'Dice_root': dice_per_cls['root'],
+            'Precision_aerial': precision_per_cls['aerial'],
+            'Precision_root': precision_per_cls['root'],
+            'Recall_aerial': recall_per_cls['aerial'],
+            'Recall_root': recall_per_cls['root'],
+        }
+        metrics_df = pd.DataFrame([metrics_data])
+        metrics_csv = metrics_df.to_csv(index=False, float_format='%.4f')
+        with open(os.path.join(output_dir, "segmentation_metrics.csv"), "w", encoding="utf-8") as f:
+            f.write(metrics_csv)
+        current_miou = seg_metrics_dict["mIoU"]
+        if current_miou is None or math.isnan(float(current_miou)):
+            current_miou = 0.0
+
+        # 2. Descobre qual era o melhor valor até este trial
+        try:
+            best_value_so_far = trial.study.best_value
+        except ValueError:
+            # Se for o primeiro trial (trial 0), ainda não existe best_value
+            best_value_so_far = -1.0
+
+        
+        if current_miou >= best_value_so_far:
+            if os.path.exists(best_trial_dir):
+                shutil.rmtree(best_trial_dir)
+            shutil.copytree(output_dir, best_trial_dir)
+            print(f"Novo melhor trial ({trial.number}) com mIoU = {current_miou:.4f}. Pesos e métricas preservados!")
+
+        
+        
+        return current_miou
+    except optuna.TrialPruned:
+        raise
+    finally:
+        if os.path.exists(output_dir):
+            shutil.rmtree(output_dir, ignore_errors=True)
+        if predictor is not None:
+            del predictor
+        if coco is not None:
+            del coco
+
+        gc.collect()
+        torch.cuda.empty_cache()
 
 if __name__ == '__main__':
     start = time.time()
@@ -143,8 +186,13 @@ if __name__ == '__main__':
         
         study = optuna.create_study(
             direction="maximize",
-            study_name=f"fold_1",
+            study_name="fold_1",
             storage="sqlite:///optuna.db",
+            pruner = optuna.pruners.MedianPruner(
+                n_startup_trials=N_STARTUP_TRIALS,
+                n_warmup_steps=500,
+                interval_steps=EVAL_PERIOD
+            ),
             load_if_exists=True
         )
 
@@ -160,6 +208,19 @@ if __name__ == '__main__':
                 n_trials=N_TRIALS,
                 catch=(Exception,)
             )
+
+            pruned_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED]
+            complete_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+            print(f"\n--- RELATÓRIO DO TESTE ---")
+            print(f"Total de trials completas: {len(complete_trials)}")
+            print(f"Total de trials podadas pelo Pruner: {len(pruned_trials)}")
+            for t in pruned_trials:
+                if t.intermediate_values:
+                    step = max(t.intermediate_values.keys())
+                    score = t.intermediate_values[step]
+                    print(f"  -> Trial {t.number} podada na época {step} com score {score:.4f}")
+                else:
+                    print(f"  -> Trial {t.number} podada sem passos intermediários.")
 
         # Treino final com os melhores parâmetros encontrados
         print(f"Melhores parâmetros encontrados para o Fold {fold}:", study.best_params)
@@ -225,11 +286,34 @@ if __name__ == '__main__':
         metrics_dict = inference_on_dataset(predictor.model, test_loader, evaluator)
         coco = COCO(TEST_JSON_DIR)
         seg_metrics_dict = evaluate_semantic_metrics(predictor, coco, TEST_DATA_DIR, TEST_NAME)
-        seg_metrics_df = pd.json_normalize(seg_metrics_dict)
-        seg_metrics_df.to_csv(os.path.join(output_dir, "seg_metrics.csv"), index=False)
-        with open(os.path.join(output_dir, "best_params.txt"), "w") as f:
-            f.write(f"Best Value: {study.best_value}\n")
-            f.write(str(study.best_params))
+
+        miou = seg_metrics_dict['mIoU']
+        mdice = seg_metrics_dict['mDice']
+        precision = seg_metrics_dict['Precision']
+        recall = seg_metrics_dict['Recall']
+        iou_per_cls = seg_metrics_dict['mIoU_per_class']
+        dice_per_cls = seg_metrics_dict['mDice_per_class']
+        precision_per_cls = seg_metrics_dict['Precision_per_class']
+        recall_per_cls = seg_metrics_dict['Recall_per_class']
+
+        metrics_data = {
+            'mIoU': miou,
+            'mDice': mdice,
+            'Precision_pixel': precision,
+            'Recall_pixel': recall,
+            'Iou_aerial': iou_per_cls['aerial'],
+            'Iou_root': iou_per_cls['root'],
+            'Dice_aerial': dice_per_cls['aerial'],
+            'Dice_root': dice_per_cls['root'],
+            'Precision_aerial': precision_per_cls['aerial'],
+            'Precision_root': precision_per_cls['root'],
+            'Recall_aerial': recall_per_cls['aerial'],
+            'Recall_root': recall_per_cls['root'],
+        }
+        metrics_df = pd.DataFrame([metrics_data])
+        metrics_csv = metrics_df.to_csv(index=False, float_format='%.4f')
+        with open(os.path.join(output_dir, "segmentation_metrics.csv"), "w", encoding="utf-8") as f:
+            f.write(metrics_csv)
 
         extract_measurements_from_masks(
             cfg_path=cfg_path,
@@ -251,17 +335,36 @@ if __name__ == '__main__':
                 index=False
             )
 
-            fig = plot_param_importances(study)
-            fig.write_image(os.path.join(optuna_path,"param_importances.png"))
-            fig.write_html(os.path.join(optuna_path,"param_importances.html"))
+            with open(os.path.join("folds", "best_params.txt"), "w") as f:
+                f.write(f"Best Value: {study.best_value}\n")
+                f.write(str(study.best_params))
+            # fig = plot_param_importances(study)
+            # fig.write_image(os.path.join(optuna_path,"param_importances.png"))
+            # fig.write_html(os.path.join(optuna_path,"param_importances.html"))
 
-            fig = plot_optimization_history(study)
-            fig.write_image(os.path.join(optuna_path,"optimization_history.png"))
-            fig.write_html(os.path.join(optuna_path,"optimization_history.html"))
+            # fig = plot_optimization_history(study)
+            # fig.write_image(os.path.join(optuna_path,"optimization_history.png"))
+            # fig.write_html(os.path.join(optuna_path,"optimization_history.html"))
             
-            fig = plot_timeline(study)
-            fig.write_image(os.path.join(optuna_path,"timeline.png"))
-            fig.write_html(os.path.join(optuna_path,"timeline.html"))
+            # fig = plot_timeline(study)
+            # fig.write_image(os.path.join(optuna_path,"timeline.png"))
+            # fig.write_html(os.path.join(optuna_path,"timeline.html"))
+            
+            plots = [
+                ("param_importances", plot_param_importances),
+                ("optimization_history", plot_optimization_history),
+                ("timeline", plot_timeline),
+            ]
+            for plot_name, plot_func in plots:
+                try:
+                    fig = plot_func(study)
+                    fig.write_html(os.path.join(optuna_path, f"{plot_name}.html"))
+                    try:
+                        fig.write_image(os.path.join(optuna_path, f"{plot_name}.png"))
+                    except Exception as img_err:
+                        print(f"Aviso: Não foi possível gerar {plot_name}.png (necessário Chrome): {img_err}")
+                except Exception as plot_err:
+                    print(f"Aviso: Não foi possível gerar o gráfico {plot_name}: {plot_err}")
 
         print(f"--- FOLD {fold} FINALIZADO ---")
         # Liberar a memória da GPU usada durante o fold atual

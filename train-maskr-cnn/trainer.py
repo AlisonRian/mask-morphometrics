@@ -1,7 +1,8 @@
+from detectron2.engine import HookBase
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
-
+import optuna
 from detectron2 import config
 from math import degrees
 import detectron2
@@ -22,39 +23,89 @@ from detectron2.evaluation import COCOEvaluator
 from detectron2.data import transforms as T
 from detectron2.data.transforms import Transform, Augmentation, NoOpTransform
 import os
+from pycocotools.coco import COCO
+from utils import evaluate_semantic_metrics
 
-# class GaussianBlurTransform(Transform):
-#     """Aplica GaussianBlur com ksize=(0,0) e sigmaX definido em float."""
-#     def __init__(self, sigma):
-#         super().__init__()
-#         self._set_attributes(locals())
+import torch
+import optuna
+from detectron2.engine import HookBase
+from detectron2.data import MetadataCatalog
+from detectron2.data import transforms as T
+from pycocotools.coco import COCO
+from utils import evaluate_semantic_metrics
 
-#     def apply_image(self, img):
-#         # ksize=(0,0) faz o OpenCV calcular o tamanho do kernel a partir do sigma
-#         return cv2.GaussianBlur(img, (0, 0), self.sigma)
+class SemanticMetricsHook(HookBase):
+    def __init__(self, eval_period: int, trial: optuna.Trial = None):
+        self.eval_period = eval_period
+        self.trial = trial
+        self._coco = None
+        self._val_name = None
+        self._val_data_dir = None
+        self.latest_metrics = {}
 
-#     def apply_coords(self, coords):
-#         return coords
+    def _build_predictor_wrapper(self):
+        cfg = self.trainer.cfg
+        model = self.trainer.model
+        aug = T.ResizeShortestEdge(
+            [cfg.INPUT.MIN_SIZE_TEST, cfg.INPUT.MIN_SIZE_TEST],
+            cfg.INPUT.MAX_SIZE_TEST
+        )
 
-#     def apply_segmentation(self, segmentation):
-#         return segmentation
+        def _predict(image_bgr):
+            height, width = image_bgr.shape[:2]
+            transformed = aug.get_transform(image_bgr).apply_image(image_bgr)
+            tensor_img = torch.as_tensor(transformed.astype("float32").transpose(2, 0, 1)).to(cfg.MODEL.DEVICE)
+            inputs = [{"image": tensor_img, "height": height, "width": width}]
+            return model(inputs)[0]
 
-#     def apply_box(self, box):
-#         return box
+        return _predict
 
-# class RandomGaussianBlur(Augmentation):
-#     """Augmentation de desfoque gaussiano com sigma amostrado de um intervalo."""
-#     def __init__(self, prob=0.5, sigma_range=(0.2, 0.8)):
-#         super().__init__()
-#         self._init(locals())
+    def after_step(self):
+        next_iter = self.trainer.iter + 1
+        is_final = next_iter >= self.trainer.max_iter
 
-#     def get_transform(self, image):
-#         if np.random.rand() < self.prob:
-#             sigma = float(np.random.uniform(self.sigma_range[0], self.sigma_range[1]))
-#             return GaussianBlurTransform(sigma)
-#         else:
-#             return NoOpTransform()
+        # Executa somente no período configurado ou no final do treino
+        if (self.eval_period > 0 and next_iter % self.eval_period == 0) or is_final:
+            if self._coco is None:
+                self._val_name = self.trainer.cfg.DATASETS.TEST[0]
+                meta = MetadataCatalog.get(self._val_name)
+                self._val_data_dir = meta.image_root
+                self._coco = COCO(meta.json_file)
 
+            # Coloca em modo de inferência
+            was_training = self.trainer.model.training
+            self.trainer.model.eval()
+
+            try:
+                predictor = self._build_predictor_wrapper()
+                with torch.no_grad():
+                    metrics = evaluate_semantic_metrics(
+                        predictor, 
+                        self._coco, 
+                        self._val_data_dir, 
+                        self._val_name
+                    )
+
+                self.latest_metrics = metrics
+                miou = metrics["mIoU"]
+
+                # 1. Registra no histórico nativo do Detectron2 (Tensorboard / Logs)
+                if hasattr(self.trainer, "storage"):
+                    self.trainer.storage.put_scalar("val/mIoU", miou)
+                    self.trainer.storage.put_scalar("val/mDice", metrics["mDice"])
+
+                # 2. Se estiver rodando dentro do Optuna, reporta e avalia poda
+                if self.trial is not None:
+                    self.trial.report(miou, step=next_iter)
+                    if self.trial.should_prune():
+                        raise optuna.TrialPruned(
+                            f"Trial {self.trial.number} podado no step {next_iter} (mIoU: {miou:.4f})"
+                        )
+
+            finally:
+                if was_training:
+                    self.trainer.model.train()
+            
 class MyTrainer(DefaultTrainer):
     @classmethod
     def build_evaluator(cls, cfg, dataset_name, output_folder=None):
@@ -137,6 +188,8 @@ def get_train_cfg(
         random_flip: str = 'horizontal',
         random_flip_prob: float = 0.5,
         ):
+    # Para evitar de realizar a avaliação com COCO_evaluator e realizar apenas com o SemanticHook
+    eval_period = 0
     cfg = get_cfg()
     cfg.merge_from_file(model_zoo.get_config_file(model_name))
     cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url(model_name)
@@ -188,7 +241,7 @@ def get_train_cfg(
 
     return cfg
 
-def train(output_dir: str, cfg, resume:bool=True):
+def train(output_dir: str, cfg, resume:bool=True, trial: optuna.Trial = None, eval_period:int = 0):
     os.makedirs(output_dir, exist_ok=True)
     
     cfg_save_path = os.path.join(output_dir, 'IS_cfg.pickle')
@@ -197,45 +250,14 @@ def train(output_dir: str, cfg, resume:bool=True):
 
     trainer = MyTrainer(cfg)
     trainer.resume_or_load(resume=resume)
+
+    if eval_period > 0:
+        semantic_hook = SemanticMetricsHook(
+            eval_period=eval_period, 
+            trial=trial
+        )
+        trainer.register_hooks([semantic_hook])
     trainer.train()
-
-# if __name__ == '__main__':
-#     TRAIN_DATA_DIR = r'train-maskr-cnn\dataset\train'
-#     TRAIN_JSON_DIR = r'train-maskr-cnn\dataset\train\_annotations_fixed.coco.json'
-#     VALID_DATA_DIR = r'train-maskr-cnn\dataset\valid'
-#     VALID_JSON_DIR = r'train-maskr-cnn\dataset\valid\_annotations_fixed.coco.json'
-#     TRAIN_NAME = "my_dataset_train"
-#     VAL_NAME = "my_dataset_val"
-#     # Caminho do modelo
-#     MODEL_NAME = "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"
-#     OUTPUT_DIR = r'train-maskr-cnn\results2'
-#     # Definir os dataset
-#     # Dataset de Treino
-#     register_coco_instances(TRAIN_NAME,{},TRAIN_JSON_DIR, TRAIN_DATA_DIR)
-#     # Dataset de Validação
-#     register_coco_instances(VAL_NAME,{},VALID_JSON_DIR, VALID_DATA_DIR)
-    
-
-#     cfg = get_train_cfg(
-#         model_name=MODEL_NAME,
-#         train_name=TRAIN_NAME,
-#         val_name=VAL_NAME,
-#         min_size_train=1024,
-#         max_size_train=1024,
-#         eval_period=180,
-#         num_workers=4,
-#         batch_size=2,
-#         learning_rate=0.00025,
-#         iterations=2700,
-#         weight_decay=0.0001,
-#         amp_enabled=True,
-#         solver_steps=(1890, 2430),
-#         checkpoint_period=450,
-#         num_classes=2,
-#         output_dir=OUTPUT_DIR
-#     )
-
-#     train(output_dir=OUTPUT_DIR, cfg=cfg)
 
 
 

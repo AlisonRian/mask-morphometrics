@@ -117,18 +117,50 @@ def calculate_pixel_to_cm_ratio(
 
     return scale
 
-def compute_iou_and_dice(pred_mask: np.ndarray, gt_mask: np.ndarray, smooth: float = 1e-6):
+def compute_all_metrics(pred_mask: np.ndarray, gt_mask: np.ndarray):
     """
+    Calcula IoU, Dice (F1), Precision e Recall em uma única passada.
     pred_mask e gt_mask: arrays binários (bool ou uint8 0/1) de mesma dimensão (H, W).
+    Retorna: (iou, dice, precision, recall, TP, FP, FN)
     """
-    intersection = np.logical_and(pred_mask, gt_mask).sum()
-    total_area = pred_mask.sum() + gt_mask.sum()
-    union = np.logical_or(pred_mask, gt_mask).sum()
-    # IoU
-    iou = (intersection + smooth) / (union + smooth) if union > 0 else 1.0
-    # Dice Score (F1-Score)
-    dice = (2.0 * intersection + smooth) / (total_area + smooth) if total_area > 0 else 1.0
-    return float(iou), float(dice)
+    pred_bin = pred_mask.astype(bool)
+    gt_bin = gt_mask.astype(bool)
+
+    pred_count = int(pred_bin.sum())
+    gt_count = int(gt_bin.sum())
+
+    if pred_count == 0 and gt_count == 0:
+        return 1.0, 1.0, 1.0, 1.0, 0, 0, 0
+
+    TP = int(np.logical_and(pred_bin, gt_bin).sum())
+    FP = pred_count - TP
+    FN = gt_count - TP
+
+    total_area = pred_count + gt_count
+    union = total_area - TP
+
+    iou = float(TP / union) if union > 0 else 1.0
+    dice = float((2.0 * TP) / total_area) if total_area > 0 else 1.0
+    precision = float(TP / pred_count) if pred_count > 0 else 0.0
+    recall = float(TP / gt_count) if gt_count > 0 else 0.0
+
+    return iou, dice, precision, recall, TP, FP, FN
+
+def compute_iou_and_dice(pred_mask: np.ndarray, gt_mask: np.ndarray):
+    """
+    Mantido para compatibilidade retroativa.
+    Retorna: (iou, dice)
+    """
+    iou, dice, *_ = compute_all_metrics(pred_mask, gt_mask)
+    return iou, dice
+
+def calculate_precision_recall(pred_mask: np.ndarray, gt_mask: np.ndarray):
+    """
+    Mantido para compatibilidade retroativa.
+    Retorna: (precision, recall, TP, FP, FN)
+    """
+    _, _, precision, recall, TP, FP, FN = compute_all_metrics(pred_mask, gt_mask)
+    return precision, recall, TP, FP, FN
 
 def evaluate_semantic_metrics(predictor, coco, test_data_dir, dataset_name):
     from detectron2.data import MetadataCatalog
@@ -145,14 +177,15 @@ def evaluate_semantic_metrics(predictor, coco, test_data_dir, dataset_name):
     if id_map is None:
         id_map = {cat: i for i, cat in enumerate(sorted(cat_ids))}
         
-    # if per_class:
     ious_per_class = {cat_id: [] for cat_id in cat_ids}
     dices_per_class = {cat_id: [] for cat_id in cat_ids}
+    precisions_per_class = {cat_id: [] for cat_id in cat_ids}
+    recalls_per_class = {cat_id: [] for cat_id in cat_ids}
+
     all_iou = []
     all_dice = []
-    # else:
-    #     ious_gerais = []
-    #     dices_gerais = []
+    all_precision = []
+    all_recall = []
         
     for img_id in img_ids:
         img_info = coco.loadImgs(img_id)[0]
@@ -168,7 +201,7 @@ def evaluate_semantic_metrics(predictor, coco, test_data_dir, dataset_name):
         outputs = predictor(img)
         pred_instances = outputs["instances"].to("cpu")
         
-        # if per_class:
+        # --- A) Métricas por Classe ---
         for cat_id in cat_ids:
             ann_ids = coco.getAnnIds(imgIds=img_id, catIds=[cat_id])
             anns = coco.loadAnns(ann_ids)
@@ -195,48 +228,79 @@ def evaluate_semantic_metrics(predictor, coco, test_data_dir, dataset_name):
             if pred_bin.shape != gt_mask.shape:
                 pred_bin = cv2.resize(pred_bin.astype(np.uint8), (width, height), interpolation=cv2.INTER_NEAREST).astype(bool)
                 
-            iou, dice = compute_iou_and_dice(pred_bin, gt_mask)
+            iou, dice, prec, rec, *_ = compute_all_metrics(pred_bin, gt_mask)
+
             ious_per_class[cat_id].append(iou)
             dices_per_class[cat_id].append(dice)
-        # else:
-            # Tudo unificado numa única máscara
-            ann_ids = coco.getAnnIds(imgIds=img_id)
-            anns = coco.loadAnns(ann_ids)
+            precisions_per_class[cat_id].append(prec)
+            recalls_per_class[cat_id].append(rec)
+
+        # --- B) Métrica Global (instâncias unificadas) ---
+        ann_ids = coco.getAnnIds(imgIds=img_id)
+        anns = coco.loadAnns(ann_ids)
+        
+        gt_mask = np.zeros((height, width), dtype=bool)
+        for ann in anns:
+            m = coco.annToMask(ann)
+            if len(m.shape) == 3:
+                m = np.any(m, axis=2)
+            gt_mask = np.logical_or(gt_mask, m > 0)
             
-            gt_mask = np.zeros((height, width), dtype=bool)
-            for ann in anns:
-                m = coco.annToMask(ann)
-                if len(m.shape) == 3:
-                    m = np.any(m, axis=2)
-                gt_mask = np.logical_or(gt_mask, m > 0)
-                
-            if len(pred_instances) > 0:
-                pred_masks = pred_instances.pred_masks.numpy()
-                pred_bin = np.any(pred_masks, axis=0).astype(bool)
-            else:
-                pred_bin = np.zeros((height, width), dtype=bool)
-                
-            if pred_bin.shape != gt_mask.shape:
-                pred_bin = cv2.resize(pred_bin.astype(np.uint8), (width, height), interpolation=cv2.INTER_NEAREST).astype(bool)
-                
-            iou, dice = compute_iou_and_dice(pred_bin, gt_mask)
-            all_iou.append(iou)
-            all_dice.append(dice)
+        if len(pred_instances) > 0:
+            pred_masks = pred_instances.pred_masks.numpy()
+            pred_bin = np.any(pred_masks, axis=0).astype(bool)
+        else:
+            pred_bin = np.zeros((height, width), dtype=bool)
+            
+        if pred_bin.shape != gt_mask.shape:
+            pred_bin = cv2.resize(pred_bin.astype(np.uint8), (width, height), interpolation=cv2.INTER_NEAREST).astype(bool)
+            
+        iou, dice, prec, rec, *_ = compute_all_metrics(pred_bin, gt_mask)
+
+        all_iou.append(iou)
+        all_dice.append(dice)
+        all_precision.append(prec)
+        all_recall.append(rec)
             
     # Resultado Final
-    print("\n" + "="*40)
-    print("MÉTRICAS SEMÂNTICAS (mIoU e mDice)")
-    # if per_class:
+    print("\n" + "="*60)
+    print("MÉTRICAS SEMÂNTICAS (mIoU, mDice, Precision, Recall)")
     miou_per_class = {}
     mdice_per_class = {}
+    mprec_per_class = {}
+    mrec_per_class = {}
+
     for cat_id in cat_ids:
         cat_name = coco.loadCats(cat_id)[0]['name']
-        mean_iou = np.mean(ious_per_class[cat_id])
-        mean_dice = np.mean(dices_per_class[cat_id])
+        mean_iou = float(np.mean(ious_per_class[cat_id])) if len(ious_per_class[cat_id]) > 0 else 0.0
+        mean_dice = float(np.mean(dices_per_class[cat_id])) if len(dices_per_class[cat_id]) > 0 else 0.0
+        mean_prec = float(np.mean(precisions_per_class[cat_id])) if len(precisions_per_class[cat_id]) > 0 else 0.0
+        mean_rec = float(np.mean(recalls_per_class[cat_id])) if len(recalls_per_class[cat_id]) > 0 else 0.0
+
         miou_per_class[cat_name] = mean_iou
         mdice_per_class[cat_name] = mean_dice
-        print(f"Classe [{cat_name}]: IoU = {mean_iou:.4f}, Dice = {mean_dice:.4f}")
-    print(f"Global: Mean IoU = {np.mean(all_iou):.4f}, Mean Dice = {np.mean(all_dice):.4f}")
-    print("="*40 + "\n")
-    return {'mIoU': np.mean(all_iou), 'mDice': np.mean(all_dice), 'mIoU_per_class': miou_per_class, 'mDice_per_class': mdice_per_class}
+        mprec_per_class[cat_name] = mean_prec
+        mrec_per_class[cat_name] = mean_rec
+
+        print(f"Classe [{cat_name}]: IoU = {mean_iou:.4f}, Dice = {mean_dice:.4f}, Precision = {mean_prec:.4f}, Recall = {mean_rec:.4f}")
+
+    global_miou = float(np.mean(all_iou)) if len(all_iou) > 0 else 0.0
+    global_mdice = float(np.mean(all_dice)) if len(all_dice) > 0 else 0.0
+    global_mprec = float(np.mean(all_precision)) if len(all_precision) > 0 else 0.0
+    global_mrec = float(np.mean(all_recall)) if len(all_recall) > 0 else 0.0
+
+    print("-" * 60)
+    print(f"Global: IoU = {global_miou:.4f}, Dice = {global_mdice:.4f}, Precision = {global_mprec:.4f}, Recall = {global_mrec:.4f}")
+    print("="*60 + "\n")
+
+    return {
+        'mIoU': global_miou,
+        'mDice': global_mdice,
+        'Precision': global_mprec,
+        'Recall': global_mrec,
+        'mIoU_per_class': miou_per_class,
+        'mDice_per_class': mdice_per_class,
+        'Precision_per_class': mprec_per_class,
+        'Recall_per_class': mrec_per_class
+    }
 

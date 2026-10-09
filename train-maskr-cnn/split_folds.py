@@ -112,12 +112,7 @@ def split_to_holdout_train(dataset_path:str, train_batches:list[str], fold: int)
 
     with open(os.path.join(holdout_path, 'val', "annotations.json"), "w") as file:
         json.dump(val_json_data, file)
-    """
-        TRAIN_DATA_DIR
-        VAL_DATA_DIR
-        TRAIN_JSON_DIR
-        VAL_JSON_DIR    
-    """
+        
     output = {
         'TRAIN_DATA_DIR':os.path.join(holdout_path, 'train'),
         'VAL_DATA_DIR':os.path.join(holdout_path, 'val'),

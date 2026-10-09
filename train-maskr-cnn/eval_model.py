@@ -8,7 +8,7 @@ from detectron2.data import build_detection_test_loader
 from detectron2.data.datasets import register_coco_instances
 import cv2
 import numpy as np
-from utils import compute_iou_and_dice
+from utils import compute_iou_and_dice, evaluate_semantic_metrics
 # Define o dataset de teste
 TEST_NAME = "my_dataset_test"
 TEST_DATA_DIR = r'train-maskr-cnn\Dataset_splitted\L1'
@@ -26,7 +26,7 @@ with open(cfg_saved_path, 'rb') as f:
 cfg.MODEL.WEIGHTS = os.path.join(output_dir, "model_final.pth")
 # Define o limiar de confiança na inferência 
 cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.5
-cfg.MODEL.DEVICE = 'cpu'
+cfg.MODEL.DEVICE = 'cuda'
 
 # Executa a inferência e salva as métricas das Bbox e masks (mAP50, mAP50-95)
 # if __name__ == '__main__':
@@ -36,9 +36,10 @@ cfg.MODEL.DEVICE = 'cpu'
 
     # # Executa a inferência em todo o conjunto
     # metrics_dict = inference_on_dataset(DefaultPredictor(cfg).model, val_loader, evaluator)
-# if __name__ == '__main__':
-#     predictor = DefaultPredictor(cfg)
-#     coco = COCO(TEST_JSON_DIR)
+if __name__ == '__main__':
+    predictor = DefaultPredictor(cfg)
+    coco = COCO(TEST_JSON_DIR)
     
-#     # Chama a função nova (altere per_class=True para ver por classe)
-#     seg_metrics_dict = evaluate_semantic_metrics(predictor, coco, TEST_DATA_DIR, TEST_NAME)
+    # Chama a função nova (altere per_class=True para ver por classe)
+    seg_metrics_dict = evaluate_semantic_metrics(predictor, coco, TEST_DATA_DIR, TEST_NAME)
+    print(seg_metrics_dict)
